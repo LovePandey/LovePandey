@@ -3,6 +3,7 @@
 Run with: streamlit run app.py
 """
 
+import hmac
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -11,12 +12,80 @@ import plotly.graph_objects as go
 from excel_analytics.analyzer import load_excel, summarize_dataframe, compute_fpa_analytics
 from generate_sample_data import generate_fpa_data
 
+
 st.set_page_config(
     page_title="FP&A Analytics Dashboard",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+MAX_FILE_SIZE_MB = 50
+ALLOWED_EXTENSIONS = (".xlsx", ".xls")
+
+
+# ── Authentication ────────────────────────────────────────────────────────────
+
+def check_password():
+    """Gate the app behind a password. Configure in .streamlit/secrets.toml."""
+    if "password" not in st.secrets:
+        return True
+
+    if st.session_state.get("authenticated"):
+        return True
+
+    st.title("FP&A Analytics Dashboard")
+    st.markdown("---")
+
+    with st.form("login_form"):
+        password = st.text_input("Password", type="password", placeholder="Enter access password")
+        submitted = st.form_submit_button("Sign In", use_container_width=True)
+
+    if submitted:
+        if hmac.compare_digest(password, st.secrets["password"]):
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+
+    st.caption("Contact your admin for access credentials.")
+    return False
+
+
+if not check_password():
+    st.stop()
+
+
+# ── File Validation ───────────────────────────────────────────────────────────
+
+def validate_and_load(uploaded_file):
+    """Validate uploaded file and return sheets dict, or None on error."""
+    if uploaded_file.size > MAX_FILE_SIZE_MB * 1024 * 1024:
+        st.sidebar.error(f"File too large. Maximum size is {MAX_FILE_SIZE_MB} MB.")
+        return None
+
+    name = uploaded_file.name.lower()
+    if not name.endswith(ALLOWED_EXTENSIONS):
+        st.sidebar.error("Invalid file type. Please upload .xlsx or .xls files only.")
+        return None
+
+    try:
+        sheets = load_excel(uploaded_file)
+    except Exception as e:
+        st.sidebar.error(f"Failed to read Excel file: {e}")
+        return None
+
+    if not sheets:
+        st.sidebar.error("The uploaded file contains no sheets.")
+        return None
+
+    total_rows = sum(len(df) for df in sheets.values())
+    if total_rows == 0:
+        st.sidebar.warning("All sheets are empty.")
+        return None
+
+    return sheets
+
 
 # ── Sidebar: Data Source ──────────────────────────────────────────────────────
 
@@ -28,10 +97,11 @@ sheets = None
 if data_source == "Upload Excel File":
     uploaded = st.sidebar.file_uploader("Upload your Excel file", type=["xlsx", "xls"])
     if uploaded:
-        sheets = load_excel(uploaded)
-        st.sidebar.success(f"Loaded {len(sheets)} sheet(s)")
-        for name, df in sheets.items():
-            st.sidebar.caption(f"  {name}: {len(df)} rows x {len(df.columns)} cols")
+        sheets = validate_and_load(uploaded)
+        if sheets:
+            st.sidebar.success(f"Loaded {len(sheets)} sheet(s)")
+            for name, df in sheets.items():
+                st.sidebar.caption(f"  {name}: {len(df)} rows x {len(df.columns)} cols")
 else:
     if st.sidebar.button("Generate Sample FP&A Data"):
         st.session_state["sample_generated"] = True
@@ -61,7 +131,16 @@ You don't need all sheets - the dashboard adapts to whatever is available.
 
 # ── Compute Analytics ─────────────────────────────────────────────────────────
 
-analytics = compute_fpa_analytics(sheets)
+try:
+    analytics = compute_fpa_analytics(sheets)
+except Exception as e:
+    st.error(f"Analytics computation failed: {e}")
+    st.info("Check that your Excel sheets match the expected column format above.")
+    st.stop()
+
+if not analytics:
+    st.warning("No recognized FP&A sheets found. The dashboard expects sheets named: PnL, Budget_vs_Actual, CashFlow, Headcount, KPIs.")
+    st.stop()
 
 # ── Sidebar: Navigation ──────────────────────────────────────────────────────
 
@@ -95,7 +174,6 @@ if page == "P&L / Income Statement":
 
     st.title("P&L / Income Statement")
 
-    # KPI cards
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total Revenue", f"${pnl['total_revenue']:,.0f}")
     c2.metric("Total Expenses", f"${pnl['total_expenses']:,.0f}")
@@ -105,7 +183,6 @@ if page == "P&L / Income Statement":
 
     st.markdown("---")
 
-    # Revenue vs Expenses trend
     col1, col2 = st.columns(2)
 
     with col1:
@@ -145,7 +222,6 @@ if page == "P&L / Income Statement":
                           yaxis=dict(title="Margin %"))
         st.plotly_chart(fig, use_container_width=True)
 
-    # Category breakdown
     st.subheader("Expense Breakdown by Category")
     cat_totals = pnl["category_totals"]
     fig = px.pie(
@@ -157,7 +233,6 @@ if page == "P&L / Income Statement":
     fig.update_layout(height=400, template="plotly_dark")
     st.plotly_chart(fig, use_container_width=True)
 
-    # Detailed P&L table
     with st.expander("Detailed P&L Line Items"):
         pnl_df = pd.DataFrame(pnl["line_items"])
         st.dataframe(pnl_df, use_container_width=True, hide_index=True)
@@ -183,7 +258,6 @@ elif page == "Budget vs Actuals":
 
     col1, col2 = st.columns(2)
 
-    # Monthly budget vs actual
     with col1:
         bm = budget["by_month"]
         fig = go.Figure()
@@ -197,7 +271,6 @@ elif page == "Budget vs Actuals":
                           barmode="group", height=400, template="plotly_dark")
         st.plotly_chart(fig, use_container_width=True)
 
-    # Variance by month
     with col2:
         fig = go.Figure()
         colors = ["#10b981" if v < 0 else "#ef4444" for v in bm["Variance"]]
@@ -207,7 +280,6 @@ elif page == "Budget vs Actuals":
                           height=400, template="plotly_dark")
         st.plotly_chart(fig, use_container_width=True)
 
-    # Department breakdown
     st.subheader("Department Budget Performance")
     bd = budget["by_department"]
     dept_df = pd.DataFrame(bd)
@@ -221,7 +293,6 @@ elif page == "Budget vs Actuals":
                       height=400, template="plotly_dark")
     st.plotly_chart(fig, use_container_width=True)
 
-    # Variance table
     st.subheader("Variance Details")
     dept_df["Variance_Display"] = dept_df["Variance"].apply(lambda x: f"${x:,.0f}")
     dept_df["Variance_%_Display"] = dept_df["Variance_%"].apply(lambda x: f"{x:+.1f}%")
@@ -229,7 +300,6 @@ elif page == "Budget vs Actuals":
                           "Variance_Display", "Variance_%_Display", "Total_Forecast"]],
                  use_container_width=True, hide_index=True)
 
-    # Department filter for drill-down
     st.subheader("Department Drill-Down")
     selected_dept = st.selectbox("Select Department", bd["Department"])
     detail_df = pd.DataFrame(budget["detail"])
@@ -289,7 +359,6 @@ elif page == "Cash Flow":
                           yaxis=dict(title="Balance ($)"))
         st.plotly_chart(fig, use_container_width=True)
 
-    # Waterfall chart for net cash flow
     st.subheader("Monthly Net Cash Flow")
     colors = ["#10b981" if v >= 0 else "#ef4444" for v in cf["net_cashflow"]]
     fig = go.Figure(go.Bar(x=cf["months"], y=cf["net_cashflow"],
@@ -349,7 +418,6 @@ elif page == "Headcount & Workforce":
                           xaxis=dict(title="Total Compensation ($)"))
         st.plotly_chart(fig, use_container_width=True)
 
-    # Monthly compensation trend
     st.subheader("Monthly Compensation Trend")
     fig = go.Figure()
     fig.add_trace(go.Scatter(
@@ -371,13 +439,11 @@ elif page == "KPI Scorecard":
 
     st.title("KPI Scorecard")
 
-    # Summary cards
     cols = st.columns(4)
     for i, name in enumerate(kpis["kpi_names"][:8]):
         detail = kpis["details"][name]
         with cols[i % 4]:
             delta = detail["latest_actual"] - detail["latest_target"]
-            status = "On Track" if detail["on_track"] else "Off Track"
             st.metric(
                 name,
                 f"{detail['latest_actual']}{detail['unit']}",
@@ -386,7 +452,6 @@ elif page == "KPI Scorecard":
 
     st.markdown("---")
 
-    # KPI trend charts
     selected_kpi = st.selectbox("Select KPI for detailed view", kpis["kpi_names"])
     detail = kpis["details"][selected_kpi]
 
@@ -407,7 +472,6 @@ elif page == "KPI Scorecard":
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    # KPI summary table
     st.subheader("KPI Summary Table")
     rows = []
     for name in kpis["kpi_names"]:
@@ -442,18 +506,15 @@ elif page == "Raw Data Explorer":
 
     st.markdown("---")
 
-    # Column filter
     selected_cols = st.multiselect("Select columns to display", df.columns.tolist(),
                                    default=df.columns.tolist())
     st.dataframe(df[selected_cols], use_container_width=True, hide_index=True)
 
-    # Stats for numeric columns
     if summary["numeric_columns"]:
         with st.expander("Descriptive Statistics"):
             st.dataframe(df[summary["numeric_columns"]].describe(),
                          use_container_width=True)
 
-    # Download
     st.download_button(
         "Download as CSV",
         df.to_csv(index=False),
